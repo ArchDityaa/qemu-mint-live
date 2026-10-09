@@ -51,30 +51,37 @@ jobs:
           lsblk || true
           df -h --output=target,avail,size,pcent
 
-          # Prioritas: /mnt (temp disk besar di GH-hosted), fallback ke GITHUB_WORKSPACE, terakhir /
+          # Prioritas: /mnt jika benar-benar mount terpisah & bisa ditulis (sudo), fallback ke GITHUB_WORKSPACE
           BIG_DISK=""
           BEST_AVAIL_KB=0
-          for cand in "/mnt" "$GITHUB_WORKSPACE" "/"; do
-            if [ -d "$cand" ] && [ -w "$cand" ]; then
+          # Pastikan /mnt ada dulu (runner baru: /mnt milik root, perlu sudo)
+          sudo mkdir -p /mnt 2>/dev/null || true
+          for cand in "$GITHUB_WORKSPACE" "/" "/mnt"; do
+            if [ -d "$cand" ]; then
               AVAIL_KB=$(df --output=avail "$cand" | tail -n 1 | tr -d ' ')
-              echo "$cand avail=${AVAIL_KB}K"
-              if [ "$cand" = "/mnt" ] && [ "$AVAIL_KB" -gt 10485760 ]; then
-                # /mnt >10GB langsung menang sebagai prioritas
-                BIG_DISK="/mnt"
-                BEST_AVAIL_KB="$AVAIL_KB"
-                break
-              fi
+              IS_MNT=""
+              mountpoint -q "$cand" 2>/dev/null && IS_MNT="(mountpoint)" || IS_MNT="(bukan mount terpisah)"
+              echo "$cand avail=${AVAIL_KB}K $IS_MNT"
               if [ "$AVAIL_KB" -gt "$BEST_AVAIL_KB" ]; then
                 BEST_AVAIL_KB="$AVAIL_KB"
                 BIG_DISK="$cand"
               fi
             fi
           done
-          # /mnt menang jika imbang / hampir imbang (selisih <5GB) agar root tidak penuh
-          MNT_AVAIL_KB=$(df --output=avail /mnt 2>/dev/null | tail -n 1 | tr -d ' ' || echo 0)
-          if [ -n "$MNT_AVAIL_KB" ] && [ "$MNT_AVAIL_KB" -gt 10485760 ]; then
-            BIG_DISK="/mnt"
-            BEST_AVAIL_KB="$MNT_AVAIL_KB"
+          # /mnt menang hanya jika dia mountpoint terpisah DAN avail >10GB
+          if mountpoint -q /mnt 2>/dev/null; then
+            MNT_AVAIL_KB=$(df --output=avail /mnt | tail -n 1 | tr -d ' ')
+            if [ "$MNT_AVAIL_KB" -gt 10485760 ]; then
+              BIG_DISK="/mnt"
+              BEST_AVAIL_KB="$MNT_AVAIL_KB"
+            fi
+          else
+            echo "/mnt bukan mount terpisah (image baru hanya punya / 72G), pakai disk terbesar yang terdeteksi"
+          fi
+          # Fallback mutlak agar tidak kosong
+          if [ -z "$BIG_DISK" ]; then
+            BIG_DISK="$GITHUB_WORKSPACE"
+            BEST_AVAIL_KB=$(df --output=avail "$BIG_DISK" | tail -n 1 | tr -d ' ')
           fi
 
           echo "BIG_DISK=$BIG_DISK (${BEST_AVAIL_KB}K avail)"
@@ -82,18 +89,26 @@ jobs:
           echo "STORAGE_DIR=$BIG_DISK/qemu-storage" >> "$GITHUB_ENV"
           echo "DOCKER_ROOT=$BIG_DISK/docker-data" >> "$GITHUB_ENV"
           echo "TUNNEL_DIR=$BIG_DISK/tunnel" >> "$GITHUB_ENV"
-          mkdir -p "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel"
-          chmod 777 "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" || true
+          sudo mkdir -p "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel"
+          sudo chmod 777 "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" || true
+          sudo chown -R "$(id -u):$(id -g)" "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" 2>/dev/null || true
 
-          echo "=== pindahkan docker data-root ke $BIG_DISK/docker-data ==="
-          sudo systemctl stop docker || sudo service docker stop || true
-          sudo mkdir -p "$BIG_DISK/docker-data" /etc/docker
-          if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
-            sudo rsync -a --delete /var/lib/docker/ "$BIG_DISK/docker-data/" || sudo cp -a /var/lib/docker/. "$BIG_DISK/docker-data/"
+          echo "=== docker data-root (hanya relokasi jika BIG_DISK mount terpisah) ==="
+          if [ "$BIG_DISK" = "/mnt" ] && mountpoint -q /mnt 2>/dev/null; then
+            sudo systemctl stop docker || sudo service docker stop || true
+            sudo mkdir -p "$BIG_DISK/docker-data" /etc/docker
+            if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+              sudo rsync -a --delete /var/lib/docker/ "$BIG_DISK/docker-data/" || sudo cp -a /var/lib/docker/. "$BIG_DISK/docker-data/"
+            fi
+            echo "{\"data-root\": \"$BIG_DISK/docker-data\"}" | sudo tee /etc/docker/daemon.json
+            sudo systemctl start docker || sudo service docker start || true
+            sleep 5
+          else
+            echo "Skip relokasi docker (BIG_DISK=$BIG_DISK satu filesystem dengan /, 41G free sudah cukup)"
+            sudo rm -f /etc/docker/daemon.json || true
+            sudo systemctl restart docker || sudo service docker restart || true
+            sleep 5
           fi
-          echo "{\"data-root\": \"$BIG_DISK/docker-data\"}" | sudo tee /etc/docker/daemon.json
-          sudo systemctl start docker || sudo service docker start || true
-          sleep 5
           docker info | grep -i "docker root" || true
           docker system df || true
           df -h
