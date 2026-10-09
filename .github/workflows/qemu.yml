@@ -15,14 +15,100 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
+    env:
+      BOOT: mint
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Maximize free space (agresif)
+        run: |
+          echo "=== df BEFORE ==="
+          df -h
+          echo "=== hapus software boros (dotnet, android, ghc, codeql, powershell, swift, az) ==="
+          sudo rm -rf /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /opt/az \
+            /usr/local/julia* \
+            /opt/microsoft/powershell 2>/dev/null || true
+          sudo rm -rf /home/runner/.cache/* /home/runner/.npm /home/runner/.cargo 2>/dev/null || true
+          docker system prune -af --volumes 2>/dev/null || true
+          sudo apt-get clean
+          sudo apt-get autoremove -y || true
+          sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* 2>/dev/null || true
+          echo "=== df AFTER cleanup ==="
+          df -h
+          docker system df || true
+
+      - name: Auto-detect disk terbesar + pindahkan Docker root
+        run: |
+          echo "=== lsblk / df ==="
+          lsblk || true
+          df -h --output=target,avail,size,pcent
+
+          # Prioritas: /mnt (temp disk besar di GH-hosted), fallback ke GITHUB_WORKSPACE, terakhir /
+          BIG_DISK=""
+          BEST_AVAIL_KB=0
+          for cand in "/mnt" "$GITHUB_WORKSPACE" "/"; do
+            if [ -d "$cand" ] && [ -w "$cand" ]; then
+              AVAIL_KB=$(df --output=avail "$cand" | tail -n 1 | tr -d ' ')
+              echo "$cand avail=${AVAIL_KB}K"
+              if [ "$cand" = "/mnt" ] && [ "$AVAIL_KB" -gt 10485760 ]; then
+                # /mnt >10GB langsung menang sebagai prioritas
+                BIG_DISK="/mnt"
+                BEST_AVAIL_KB="$AVAIL_KB"
+                break
+              fi
+              if [ "$AVAIL_KB" -gt "$BEST_AVAIL_KB" ]; then
+                BEST_AVAIL_KB="$AVAIL_KB"
+                BIG_DISK="$cand"
+              fi
+            fi
+          done
+          # /mnt menang jika imbang / hampir imbang (selisih <5GB) agar root tidak penuh
+          MNT_AVAIL_KB=$(df --output=avail /mnt 2>/dev/null | tail -n 1 | tr -d ' ' || echo 0)
+          if [ -n "$MNT_AVAIL_KB" ] && [ "$MNT_AVAIL_KB" -gt 10485760 ]; then
+            BIG_DISK="/mnt"
+            BEST_AVAIL_KB="$MNT_AVAIL_KB"
+          fi
+
+          echo "BIG_DISK=$BIG_DISK (${BEST_AVAIL_KB}K avail)"
+          echo "BIG_DISK=$BIG_DISK" >> "$GITHUB_ENV"
+          echo "STORAGE_DIR=$BIG_DISK/qemu-storage" >> "$GITHUB_ENV"
+          echo "DOCKER_ROOT=$BIG_DISK/docker-data" >> "$GITHUB_ENV"
+          echo "TUNNEL_DIR=$BIG_DISK/tunnel" >> "$GITHUB_ENV"
+          mkdir -p "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel"
+          chmod 777 "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" || true
+
+          echo "=== pindahkan docker data-root ke $BIG_DISK/docker-data ==="
+          sudo systemctl stop docker || sudo service docker stop || true
+          sudo mkdir -p "$BIG_DISK/docker-data" /etc/docker
+          if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+            sudo rsync -a --delete /var/lib/docker/ "$BIG_DISK/docker-data/" || sudo cp -a /var/lib/docker/. "$BIG_DISK/docker-data/"
+          fi
+          echo "{\"data-root\": \"$BIG_DISK/docker-data\"}" | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker || sudo service docker start || true
+          sleep 5
+          docker info | grep -i "docker root" || true
+          docker system df || true
+          df -h
+
+          AVAIL_ROOT_KB=$(df --output=avail / | tail -n 1 | tr -d ' ')
+          echo "root avail=${AVAIL_ROOT_KB}K, bigdisk avail=${BEST_AVAIL_KB}K"
+          if [ "$BEST_AVAIL_KB" -lt 15728640 ]; then
+            echo "::warning::Disk terbesar hanya $((BEST_AVAIL_KB/1024/1024))GB, QEMU Mint berisiko No space left on device"
+          fi
+
       - name: Check KVM / TUN availability
         id: kvm
         run: |
+          echo "BIG_DISK=$BIG_DISK STORAGE_DIR=$STORAGE_DIR DOCKER_ROOT=$DOCKER_ROOT"
+          df -h "$BIG_DISK" / || true
           echo "=== /dev/kvm ==="
           if [ -e /dev/kvm ]; then
             ls -l /dev/kvm
@@ -34,16 +120,16 @@ jobs:
           echo "=== /dev/net/tun ==="
           ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
 
-      - name: Prepare storage
+      - name: Prepare storage (di disk terbesar)
         run: |
-          mkdir -p ./qemu
-          df -h
+          mkdir -p "$STORAGE_DIR" "$TUNNEL_DIR"
+          df -h "$STORAGE_DIR" "$TUNNEL_DIR" /
           docker --version
+          docker info | grep -i root || true
 
-      - name: Run QEMU Mint (detached)
+      - name: Run QEMU Mint (detached, default qemux)
         run: |
           set -x
-          # Bersihkan container lama jika ada
           docker rm -f qemu 2>/dev/null || true
 
           KVM_ARGS=""
@@ -58,16 +144,17 @@ jobs:
           # docker run -it --rm --name qemu -e "BOOT=mint" -p 8006:8006 --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v "${PWD:-.}/qemu:/storage" --stop-timeout 120 docker.io/qemux/qemu
           docker run -d --rm \
             --name qemu \
-            -e "BOOT=mint" \
+            -e "BOOT=${BOOT:-mint}" \
             -p 8006:8006 \
             --cap-add NET_ADMIN \
             $KVM_ARGS \
-            -v "${GITHUB_WORKSPACE}/qemu:/storage" \
+            -v "${STORAGE_DIR}:/storage" \
             --stop-timeout 120 \
             docker.io/qemux/qemu
 
           sleep 10
           docker ps
+          df -h "$STORAGE_DIR" / "$BIG_DISK"
           docker logs --tail 100 qemu || true
 
       - name: Wait for QEMU web UI :8006
@@ -78,25 +165,28 @@ jobs:
               exit 0
             fi
             echo "waiting QEMU... $i/30"
+            df -h "$STORAGE_DIR" / | tail -n 5
             sleep 5
           done
           echo "QEMU UI tidak merespons, tampilkan logs:"
           docker logs --tail 200 qemu || true
-          # Jangan gagalkan workflow, lanjut ke tunnel agar bisa diinspeksi
           exit 0
 
       - name: Install cloudflared
         run: |
-          curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          curl -fsSL -o "$TUNNEL_DIR/cloudflared.deb" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "$TUNNEL_DIR/cloudflared.deb"
           cloudflared --version
+          df -h / "$BIG_DISK" | tail -n 10
 
       - name: Start Cloudflare Quick Tunnel :8006
         id: tunnel
         run: |
-          rm -f tunnel.log tunnel.url
+          rm -f "$TUNNEL_DIR/tunnel.log" "$TUNNEL_DIR/tunnel.url" ./tunnel.log ./tunnel.url
+          ln -sf "$TUNNEL_DIR/tunnel.log" ./tunnel.log || true
+          ln -sf "$TUNNEL_DIR/tunnel.url" ./tunnel.url || true
           # Quick tunnel: URL acak https://xxx.trycloudflare.com, tanpa token
-          nohup cloudflared tunnel --url http://localhost:8006 --no-autoupdate > tunnel.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:8006 --no-autoupdate > "$TUNNEL_DIR/tunnel.log" 2>&1 &
           echo $! > /tmp/cloudflared.pid
           echo "cloudflared pid: $(cat /tmp/cloudflared.pid)"
 
@@ -104,11 +194,11 @@ jobs:
           for i in $(seq 1 24); do
             sleep 5
             echo "--- tunnel.log (attempt $i) ---"
-            cat tunnel.log || true
-            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            cat "$TUNNEL_DIR/tunnel.log" || true
+            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_DIR/tunnel.log" | head -n 1 || true)
             if [ -n "$URL" ]; then
               echo "TUNNEL_URL=$URL"
-              echo "$URL" > tunnel.url
+              echo "$URL" > "$TUNNEL_DIR/tunnel.url"
               echo "url=$URL" >> "$GITHUB_OUTPUT"
               break
             fi
@@ -116,7 +206,7 @@ jobs:
 
           if [ -z "$URL" ]; then
             echo "Gagal mendapatkan Quick Tunnel URL"
-            cat tunnel.log || true
+            cat "$TUNNEL_DIR/tunnel.log" || true
             exit 1
           fi
 
@@ -126,27 +216,39 @@ jobs:
             echo "- QEMU UI lokal: \`http://localhost:8006\` (di runner)"
             echo "- Public URL: **$URL**"
             echo "- BOOT=mint, durasi target 6 jam"
+            echo "- Storage: \`$STORAGE_DIR\` (disk: \`$BIG_DISK\`)"
             echo ""
             echo "Buka URL di atas untuk akses."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive 6 jam + heartbeat
         run: |
-          URL=$(cat tunnel.url)
+          URL=$(cat "$TUNNEL_DIR/tunnel.url")
           echo "Public URL: $URL"
+          echo "Storage: $STORAGE_DIR di $BIG_DISK"
           # 68 x 5 menit = 340 menit (~5h40m), sisakan buffer sebelum timeout 360 menit
           for i in $(seq 1 68); do
             echo "=== [$i/68] $(date -u) | URL: $URL ==="
             docker ps --filter name=qemu || true
             curl -s -o /dev/null -w "local :8006 HTTP %{http_code}\n" http://localhost:8006 || echo "local :8006 unreachable"
-            tail -n 5 tunnel.log || true
+            tail -n 5 "$TUNNEL_DIR/tunnel.log" || true
+            df -h / "$BIG_DISK" | tail -n 8
+            docker system df 2>/dev/null | tail -n 10 || true
+            # Guard: stop elegan jika big disk <3GB agar tidak corrupt runner diag log
+            BIG_AVAIL_KB=$(df --output=avail "$BIG_DISK" | tail -n 1 | tr -d ' ')
+            if [ "$BIG_AVAIL_KB" -lt 3145728 ]; then
+              echo "::error::Disk $BIG_DISK tersisa <3GB, stop elegan untuk hindari No space left on device"
+              docker logs --tail 200 qemu || true
+              exit 1
+            fi
             sleep 300
           done
 
       - name: Cleanup (always)
         if: always()
         run: |
-          cat tunnel.log || true
+          cat "$TUNNEL_DIR/tunnel.log" 2>/dev/null || cat ./tunnel.log || true
           docker logs --tail 200 qemu || true
           docker stop -t 120 qemu || true
           kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          df -h || true
