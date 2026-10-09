@@ -1,0 +1,152 @@
+name: QEMU Mint Live
+
+on:
+  workflow_dispatch: {}
+
+run-name: QEMU Mint (BOOT=mint) + Quick Tunnel :8006
+
+concurrency:
+  group: qemu-mint-live
+  cancel-in-progress: false
+
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check KVM / TUN availability
+        id: kvm
+        run: |
+          echo "=== /dev/kvm ==="
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "have_kvm=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "NO /dev/kvm (GitHub-hosted standar tidak expose KVM, QEMU fallback ke emulasi software/tcg, lambat)"
+            echo "have_kvm=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "=== /dev/net/tun ==="
+          ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
+
+      - name: Prepare storage
+        run: |
+          mkdir -p ./qemu
+          df -h
+          docker --version
+
+      - name: Run QEMU Mint (detached)
+        run: |
+          set -x
+          # Bersihkan container lama jika ada
+          docker rm -f qemu 2>/dev/null || true
+
+          KVM_ARGS=""
+          if [ -e /dev/kvm ]; then
+            KVM_ARGS="$KVM_ARGS --device=/dev/kvm"
+          fi
+          if [ -e /dev/net/tun ]; then
+            KVM_ARGS="$KVM_ARGS --device=/dev/net/tun"
+          fi
+
+          # Perintah asli (diadaptasi -d agar workflow tidak hang):
+          # docker run -it --rm --name qemu -e "BOOT=mint" -p 8006:8006 --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v "${PWD:-.}/qemu:/storage" --stop-timeout 120 docker.io/qemux/qemu
+          docker run -d --rm \
+            --name qemu \
+            -e "BOOT=mint" \
+            -p 8006:8006 \
+            --cap-add NET_ADMIN \
+            $KVM_ARGS \
+            -v "${GITHUB_WORKSPACE}/qemu:/storage" \
+            --stop-timeout 120 \
+            docker.io/qemux/qemu
+
+          sleep 10
+          docker ps
+          docker logs --tail 100 qemu || true
+
+      - name: Wait for QEMU web UI :8006
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:8006; then
+              echo "QEMU UI ready (attempt $i)"
+              exit 0
+            fi
+            echo "waiting QEMU... $i/30"
+            sleep 5
+          done
+          echo "QEMU UI tidak merespons, tampilkan logs:"
+          docker logs --tail 200 qemu || true
+          # Jangan gagalkan workflow, lanjut ke tunnel agar bisa diinspeksi
+          exit 0
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          cloudflared --version
+
+      - name: Start Cloudflare Quick Tunnel :8006
+        id: tunnel
+        run: |
+          rm -f tunnel.log tunnel.url
+          # Quick tunnel: URL acak https://xxx.trycloudflare.com, tanpa token
+          nohup cloudflared tunnel --url http://localhost:8006 --no-autoupdate > tunnel.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          echo "cloudflared pid: $(cat /tmp/cloudflared.pid)"
+
+          URL=""
+          for i in $(seq 1 24); do
+            sleep 5
+            echo "--- tunnel.log (attempt $i) ---"
+            cat tunnel.log || true
+            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$URL" ]; then
+              echo "TUNNEL_URL=$URL"
+              echo "$URL" > tunnel.url
+              echo "url=$URL" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Gagal mendapatkan Quick Tunnel URL"
+            cat tunnel.log || true
+            exit 1
+          fi
+
+          {
+            echo "## QEMU Mint Live"
+            echo ""
+            echo "- QEMU UI lokal: \`http://localhost:8006\` (di runner)"
+            echo "- Public URL: **$URL**"
+            echo "- BOOT=mint, durasi target 6 jam"
+            echo ""
+            echo "Buka URL di atas untuk akses."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive 6 jam + heartbeat
+        run: |
+          URL=$(cat tunnel.url)
+          echo "Public URL: $URL"
+          # 68 x 5 menit = 340 menit (~5h40m), sisakan buffer sebelum timeout 360 menit
+          for i in $(seq 1 68); do
+            echo "=== [$i/68] $(date -u) | URL: $URL ==="
+            docker ps --filter name=qemu || true
+            curl -s -o /dev/null -w "local :8006 HTTP %{http_code}\n" http://localhost:8006 || echo "local :8006 unreachable"
+            tail -n 5 tunnel.log || true
+            sleep 300
+          done
+
+      - name: Cleanup (always)
+        if: always()
+        run: |
+          cat tunnel.log || true
+          docker logs --tail 200 qemu || true
+          docker stop -t 120 qemu || true
+          kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
