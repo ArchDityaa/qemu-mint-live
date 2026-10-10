@@ -24,9 +24,11 @@ Di workflow diadaptasi ke mode `-d` agar tidak hang, dengan durasi hidup **6 jam
 
 ## Catatan KVM
 
-Runner `ubuntu-latest` standar **tidak expose `/dev/kvm`**, jadi QEMU fallback ke emulasi software (lambat tapi jalan). Workflow otomatis skip `--device` jika tidak ada agar tidak gagal.
+Runner `ubuntu-latest` x64 umumnya **ada `/dev/kvm`** (nested-virt, sejak 2024) tapi tidak otomatis writable.
+Workflow mengaktifkan via udev rule `99-kvm4all` + `chmod 666` agar QEMU pakai hardware acceleration.
+Jika `/dev/kvm` tidak writable, workflow otomatis fallback ke emulasi software/TCG (lambat) dengan warning.
 
-Untuk performa penuh butuh self-hosted runner dengan KVM.
+Untuk performa penuh yang dijamin butuh larger runner 4-core+ atau self-hosted runner dengan KVM.
 
 ## File
 

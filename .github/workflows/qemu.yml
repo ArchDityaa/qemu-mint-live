@@ -119,17 +119,34 @@ jobs:
             echo "::warning::Disk terbesar hanya $((BEST_AVAIL_KB/1024/1024))GB, QEMU Mint berisiko No space left on device"
           fi
 
+      - name: Enable KVM (hardware acceleration)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "NO /dev/kvm setelah udev reload"
+          # Fallback permission jika udev trigger belum sempat buat node writable
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ls -l /dev/kvm || true
+          # Bukti CPU flags untuk diagnosis TCG vs KVM
+          egrep -c '(vmx|svm)' /proc/cpuinfo || echo "0 (tanpa vmx/svm = TCG fallback)"
+
       - name: Check KVM / TUN availability
         id: kvm
         run: |
           echo "BIG_DISK=$BIG_DISK STORAGE_DIR=$STORAGE_DIR DOCKER_ROOT=$DOCKER_ROOT"
           df -h "$BIG_DISK" / || true
           echo "=== /dev/kvm ==="
-          if [ -e /dev/kvm ]; then
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             ls -l /dev/kvm
+            echo "KVM writable, QEMU akan pakai hardware acceleration"
             echo "have_kvm=true" >> "$GITHUB_OUTPUT"
+          elif [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "::warning::/dev/kvm ada tapi tidak writable, QEMU fallback ke TCG (lambat)"
+            echo "have_kvm=false" >> "$GITHUB_OUTPUT"
           else
-            echo "NO /dev/kvm (GitHub-hosted standar tidak expose KVM, QEMU fallback ke emulasi software/tcg, lambat)"
+            echo "::warning::NO /dev/kvm, QEMU fallback ke emulasi software/tcg (lambat)"
             echo "have_kvm=false" >> "$GITHUB_OUTPUT"
           fi
           echo "=== /dev/net/tun ==="
@@ -148,8 +165,11 @@ jobs:
           docker rm -f qemu 2>/dev/null || true
 
           KVM_ARGS=""
-          if [ -e /dev/kvm ]; then
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             KVM_ARGS="$KVM_ARGS --device=/dev/kvm"
+            echo "KVM enabled: /dev/kvm diteruskan ke container"
+          else
+            echo "::warning::KVM tidak writable, container jalan tanpa /dev/kvm (TCG, lambat)"
           fi
           if [ -e /dev/net/tun ]; then
             KVM_ARGS="$KVM_ARGS --device=/dev/net/tun"
