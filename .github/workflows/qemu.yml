@@ -22,6 +22,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Host spec check + approval window (30s)
+        run: |
+          echo "=== HOST SPECS ==="
+          uname -a || true
+          echo "--- CPU ---"
+          lscpu || cat /proc/cpuinfo | head -n 40 || true
+          echo "vmx/svm count: $(egrep -c '(vmx|svm)' /proc/cpuinfo || echo 0)"
+          echo "--- MEM ---"
+          free -h || true
+          echo "--- DISK ---"
+          df -h || true
+          lsblk || true
+          echo "--- KVM/TUN ---"
+          ls -l /dev/kvm 2>&1 || echo "NO /dev/kvm"
+          ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
+          echo "--- DOCKER ---"
+          docker --version 2>&1 || echo "docker belum tersedia"
+          {
+            echo "## Host Spec Approval"
+            echo ""
+            echo "Cek log step ini untuk spek host (CPU/MEM/disk/KVM)."
+            echo "Jika **TIDAK disetujui**, **Cancel workflow sekarang** dari tab Actions."
+            echo "Lanjut otomatis dalam **30 detik**."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Approval window: cancel workflow dalam 30 detik jika spek host tidak disetujui, workflow lanjut otomatis setelah itu"
+          sleep 30
+          echo "Approval window selesai, lanjut workflow"
+
       - name: Maximize free space (agresif)
         run: |
           echo "=== df BEFORE ==="
