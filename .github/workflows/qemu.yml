@@ -17,6 +17,10 @@ jobs:
       contents: read
     env:
       BOOT: mint
+      CPU_CORES: "2"
+      RAM_SIZE: "5G"
+      DISK_SIZE: "40G"
+      KVM: "Y"
 
     steps:
       - name: Checkout
@@ -37,6 +41,8 @@ jobs:
           echo "--- KVM/TUN ---"
           ls -l /dev/kvm 2>&1 || echo "NO /dev/kvm"
           ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
+          echo "--- ALOKASI GUEST (hardcode, prioritas guest) ---"
+          echo "CPU_CORES=${CPU_CORES:-2} RAM_SIZE=${RAM_SIZE:-5G} DISK_SIZE=${DISK_SIZE:-40G} KVM=${KVM:-Y} BOOT=${BOOT:-mint}"
           echo "--- DOCKER ---"
           docker --version 2>&1 || echo "docker belum tersedia"
           {
@@ -208,6 +214,10 @@ jobs:
           docker run -d --rm \
             --name qemu \
             -e "BOOT=${BOOT:-mint}" \
+            -e "CPU_CORES=${CPU_CORES:-2}" \
+            -e "RAM_SIZE=${RAM_SIZE:-5G}" \
+            -e "DISK_SIZE=${DISK_SIZE:-40G}" \
+            -e "KVM=${KVM:-Y}" \
             -p 8006:8006 \
             --cap-add NET_ADMIN \
             $KVM_ARGS \
