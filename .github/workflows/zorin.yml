@@ -1,0 +1,327 @@
+name: QEMU Zorin Live
+
+on:
+  workflow_dispatch: {}
+
+run-name: QEMU Zorin OS (BOOT=zorin) + Quick Tunnel :8006
+
+concurrency:
+  group: qemu-zorin-live
+  cancel-in-progress: false
+
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      BOOT: zorin
+      CPU_CORES: "4"
+      RAM_SIZE: "11G"
+      DISK_SIZE: "40G"
+      KVM: "Y"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Host spec check + approval window (30s)
+        run: |
+          echo "=== HOST SPECS ==="
+          uname -a || true
+          echo "--- CPU ---"
+          lscpu || cat /proc/cpuinfo | head -n 40 || true
+          echo "vmx/svm count: $(egrep -c '(vmx|svm)' /proc/cpuinfo || echo 0)"
+          echo "--- MEM ---"
+          free -h || true
+          echo "--- DISK ---"
+          df -h || true
+          lsblk || true
+          echo "--- KVM/TUN ---"
+          ls -l /dev/kvm 2>&1 || echo "NO /dev/kvm"
+          ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
+          echo "--- ALOKASI GUEST (hardcode, prioritas guest) ---"
+          echo "CPU_CORES=${CPU_CORES:-4} RAM_SIZE=${RAM_SIZE:-11G} DISK_SIZE=${DISK_SIZE:-40G} KVM=${KVM:-Y} BOOT=${BOOT:-zorin}"
+          echo "--- DOCKER ---"
+          docker --version 2>&1 || echo "docker belum tersedia"
+          {
+            echo "## Host Spec Approval"
+            echo ""
+            echo "Cek log step ini untuk spek host (CPU/MEM/disk/KVM)."
+            echo "Jika **TIDAK disetujui**, **Cancel workflow sekarang** dari tab Actions."
+            echo "Lanjut otomatis dalam **30 detik**."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Approval window: cancel workflow dalam 30 detik jika spek host tidak disetujui, workflow lanjut otomatis setelah itu"
+          sleep 30
+          echo "Approval window selesai, lanjut workflow"
+
+      - name: Maximize free space (agresif)
+        run: |
+          echo "=== df BEFORE ==="
+          df -h
+          echo "=== hapus software boros (dotnet, android, ghc, codeql, powershell, swift, az) ==="
+          sudo rm -rf /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /opt/az \
+            /usr/local/julia* \
+            /opt/microsoft/powershell 2>/dev/null || true
+          sudo rm -rf /home/runner/.cache/* /home/runner/.npm /home/runner/.cargo 2>/dev/null || true
+          docker system prune -af --volumes 2>/dev/null || true
+          sudo apt-get clean
+          sudo apt-get autoremove -y || true
+          sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* 2>/dev/null || true
+          echo "=== df AFTER cleanup ==="
+          df -h
+          docker system df || true
+
+      - name: Auto-detect disk terbesar + pindahkan Docker root
+        run: |
+          echo "=== lsblk / df ==="
+          lsblk || true
+          df -h --output=target,avail,size,pcent
+
+          # Prioritas: /mnt jika benar-benar mount terpisah & bisa ditulis (sudo), fallback ke GITHUB_WORKSPACE
+          BIG_DISK=""
+          BEST_AVAIL_KB=0
+          # Pastikan /mnt ada dulu (runner baru: /mnt milik root, perlu sudo)
+          sudo mkdir -p /mnt 2>/dev/null || true
+          for cand in "$GITHUB_WORKSPACE" "/" "/mnt"; do
+            if [ -d "$cand" ]; then
+              AVAIL_KB=$(df --output=avail "$cand" | tail -n 1 | tr -d ' ')
+              IS_MNT=""
+              mountpoint -q "$cand" 2>/dev/null && IS_MNT="(mountpoint)" || IS_MNT="(bukan mount terpisah)"
+              echo "$cand avail=${AVAIL_KB}K $IS_MNT"
+              if [ "$AVAIL_KB" -gt "$BEST_AVAIL_KB" ]; then
+                BEST_AVAIL_KB="$AVAIL_KB"
+                BIG_DISK="$cand"
+              fi
+            fi
+          done
+          # /mnt menang hanya jika dia mountpoint terpisah DAN avail >10GB
+          if mountpoint -q /mnt 2>/dev/null; then
+            MNT_AVAIL_KB=$(df --output=avail /mnt | tail -n 1 | tr -d ' ')
+            if [ "$MNT_AVAIL_KB" -gt 10485760 ]; then
+              BIG_DISK="/mnt"
+              BEST_AVAIL_KB="$MNT_AVAIL_KB"
+            fi
+          else
+            echo "/mnt bukan mount terpisah (image baru hanya punya / 72G), pakai disk terbesar yang terdeteksi"
+          fi
+          # Fallback mutlak agar tidak kosong
+          if [ -z "$BIG_DISK" ]; then
+            BIG_DISK="$GITHUB_WORKSPACE"
+            BEST_AVAIL_KB=$(df --output=avail "$BIG_DISK" | tail -n 1 | tr -d ' ')
+          fi
+
+          echo "BIG_DISK=$BIG_DISK (${BEST_AVAIL_KB}K avail)"
+          echo "BIG_DISK=$BIG_DISK" >> "$GITHUB_ENV"
+          echo "STORAGE_DIR=$BIG_DISK/qemu-storage" >> "$GITHUB_ENV"
+          echo "DOCKER_ROOT=$BIG_DISK/docker-data" >> "$GITHUB_ENV"
+          echo "TUNNEL_DIR=$BIG_DISK/tunnel" >> "$GITHUB_ENV"
+          sudo mkdir -p "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel"
+          sudo chmod 777 "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" || true
+          sudo chown -R "$(id -u):$(id -g)" "$BIG_DISK/qemu-storage" "$BIG_DISK/docker-data" "$BIG_DISK/tunnel" 2>/dev/null || true
+
+          echo "=== docker data-root (hanya relokasi jika BIG_DISK mount terpisah) ==="
+          if [ "$BIG_DISK" = "/mnt" ] && mountpoint -q /mnt 2>/dev/null; then
+            sudo systemctl stop docker || sudo service docker stop || true
+            sudo mkdir -p "$BIG_DISK/docker-data" /etc/docker
+            if [ -d /var/lib/docker ] && [ "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+              sudo rsync -a --delete /var/lib/docker/ "$BIG_DISK/docker-data/" || sudo cp -a /var/lib/docker/. "$BIG_DISK/docker-data/"
+            fi
+            echo "{\"data-root\": \"$BIG_DISK/docker-data\"}" | sudo tee /etc/docker/daemon.json
+            sudo systemctl start docker || sudo service docker start || true
+            sleep 5
+          else
+            echo "Skip relokasi docker (BIG_DISK=$BIG_DISK satu filesystem dengan /, 41G free sudah cukup)"
+            sudo rm -f /etc/docker/daemon.json || true
+            sudo systemctl restart docker || sudo service docker restart || true
+            sleep 5
+          fi
+          docker info | grep -i "docker root" || true
+          docker system df || true
+          df -h
+
+          AVAIL_ROOT_KB=$(df --output=avail / | tail -n 1 | tr -d ' ')
+          echo "root avail=${AVAIL_ROOT_KB}K, bigdisk avail=${BEST_AVAIL_KB}K"
+          if [ "$BEST_AVAIL_KB" -lt 15728640 ]; then
+            echo "::warning::Disk terbesar hanya $((BEST_AVAIL_KB/1024/1024))GB, QEMU Zorin berisiko No space left on device"
+          fi
+
+      - name: Enable KVM (hardware acceleration)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || echo "NO /dev/kvm setelah udev reload"
+          # Fallback permission jika udev trigger belum sempat buat node writable
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ls -l /dev/kvm || true
+          # Bukti CPU flags untuk diagnosis TCG vs KVM
+          egrep -c '(vmx|svm)' /proc/cpuinfo || echo "0 (tanpa vmx/svm = TCG fallback)"
+
+      - name: Check KVM / TUN availability
+        id: kvm
+        run: |
+          echo "BIG_DISK=$BIG_DISK STORAGE_DIR=$STORAGE_DIR DOCKER_ROOT=$DOCKER_ROOT"
+          df -h "$BIG_DISK" / || true
+          echo "=== /dev/kvm ==="
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "KVM writable, QEMU akan pakai hardware acceleration"
+            echo "have_kvm=true" >> "$GITHUB_OUTPUT"
+          elif [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "::warning::/dev/kvm ada tapi tidak writable, QEMU fallback ke TCG (lambat)"
+            echo "have_kvm=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::NO /dev/kvm, QEMU fallback ke emulasi software/tcg (lambat)"
+            echo "have_kvm=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "=== /dev/net/tun ==="
+          ls -l /dev/net/tun 2>&1 || echo "NO /dev/net/tun"
+
+      - name: Prepare storage (di disk terbesar)
+        run: |
+          mkdir -p "$STORAGE_DIR" "$TUNNEL_DIR"
+          df -h "$STORAGE_DIR" "$TUNNEL_DIR" /
+          docker --version
+          docker info | grep -i root || true
+
+      - name: Run QEMU Zorin OS (detached, default qemux)
+        run: |
+          set -x
+          docker rm -f qemu 2>/dev/null || true
+
+          KVM_ARGS=""
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            KVM_ARGS="$KVM_ARGS --device=/dev/kvm"
+            echo "KVM enabled: /dev/kvm diteruskan ke container"
+          else
+            echo "::warning::KVM tidak writable, container jalan tanpa /dev/kvm (TCG, lambat)"
+          fi
+          if [ -e /dev/net/tun ]; then
+            KVM_ARGS="$KVM_ARGS --device=/dev/net/tun"
+          fi
+
+          # Perintah asli (diadaptasi -d agar workflow tidak hang):
+          # docker run -it --rm --name qemu -e "BOOT=zorin" -p 8006:8006 --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v "${PWD:-.}/qemu:/storage" --stop-timeout 120 docker.io/qemux/qemu
+          docker run -d --rm \
+            --name qemu \
+            -e "BOOT=${BOOT:-zorin}" \
+            -e "CPU_CORES=${CPU_CORES:-4}" \
+            -e "RAM_SIZE=${RAM_SIZE:-11G}" \
+            -e "DISK_SIZE=${DISK_SIZE:-40G}" \
+            -e "KVM=${KVM:-Y}" \
+            -p 8006:8006 \
+            --cap-add NET_ADMIN \
+            $KVM_ARGS \
+            -v "${STORAGE_DIR}:/storage" \
+            --stop-timeout 120 \
+            docker.io/qemux/qemu
+
+          sleep 10
+          docker ps
+          df -h "$STORAGE_DIR" / "$BIG_DISK"
+          docker logs --tail 100 qemu || true
+
+      - name: Wait for QEMU web UI :8006
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:8006; then
+              echo "QEMU UI ready (attempt $i)"
+              exit 0
+            fi
+            echo "waiting QEMU... $i/30"
+            df -h "$STORAGE_DIR" / | tail -n 5
+            sleep 5
+          done
+          echo "QEMU UI tidak merespons, tampilkan logs:"
+          docker logs --tail 200 qemu || true
+          exit 0
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o "$TUNNEL_DIR/cloudflared.deb" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "$TUNNEL_DIR/cloudflared.deb"
+          cloudflared --version
+          df -h / "$BIG_DISK" | tail -n 10
+
+      - name: Start Cloudflare Quick Tunnel :8006
+        id: tunnel
+        run: |
+          rm -f "$TUNNEL_DIR/tunnel.log" "$TUNNEL_DIR/tunnel.url" ./tunnel.log ./tunnel.url
+          ln -sf "$TUNNEL_DIR/tunnel.log" ./tunnel.log || true
+          ln -sf "$TUNNEL_DIR/tunnel.url" ./tunnel.url || true
+          # Quick tunnel: URL acak https://xxx.trycloudflare.com, tanpa token
+          nohup cloudflared tunnel --url http://localhost:8006 --no-autoupdate > "$TUNNEL_DIR/tunnel.log" 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          echo "cloudflared pid: $(cat /tmp/cloudflared.pid)"
+
+          URL=""
+          for i in $(seq 1 24); do
+            sleep 5
+            echo "--- tunnel.log (attempt $i) ---"
+            cat "$TUNNEL_DIR/tunnel.log" || true
+            URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$TUNNEL_DIR/tunnel.log" | head -n 1 || true)
+            if [ -n "$URL" ]; then
+              echo "TUNNEL_URL=$URL"
+              echo "$URL" > "$TUNNEL_DIR/tunnel.url"
+              echo "url=$URL" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Gagal mendapatkan Quick Tunnel URL"
+            cat "$TUNNEL_DIR/tunnel.log" || true
+            exit 1
+          fi
+
+          {
+            echo "## QEMU Zorin Live"
+            echo ""
+            echo "- QEMU UI lokal: \`http://localhost:8006\` (di runner)"
+            echo "- Public URL: **$URL**"
+            echo "- BOOT=zorin, durasi target 6 jam"
+            echo "- Storage: \`$STORAGE_DIR\` (disk: \`$BIG_DISK\`)"
+            echo ""
+            echo "Buka URL di atas untuk akses."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive 6 jam + heartbeat
+        run: |
+          URL=$(cat "$TUNNEL_DIR/tunnel.url")
+          echo "Public URL: $URL"
+          echo "Storage: $STORAGE_DIR di $BIG_DISK"
+          # 68 x 5 menit = 340 menit (~5h40m), sisakan buffer sebelum timeout 360 menit
+          for i in $(seq 1 68); do
+            echo "=== [$i/68] $(date -u) | URL: $URL ==="
+            docker ps --filter name=qemu || true
+            curl -s -o /dev/null -w "local :8006 HTTP %{http_code}\n" http://localhost:8006 || echo "local :8006 unreachable"
+            tail -n 5 "$TUNNEL_DIR/tunnel.log" || true
+            df -h / "$BIG_DISK" | tail -n 8
+            docker system df 2>/dev/null | tail -n 10 || true
+            # Guard: stop elegan jika big disk <3GB agar tidak corrupt runner diag log
+            BIG_AVAIL_KB=$(df --output=avail "$BIG_DISK" | tail -n 1 | tr -d ' ')
+            if [ "$BIG_AVAIL_KB" -lt 3145728 ]; then
+              echo "::error::Disk $BIG_DISK tersisa <3GB, stop elegan untuk hindari No space left on device"
+              docker logs --tail 200 qemu || true
+              exit 1
+            fi
+            sleep 300
+          done
+
+      - name: Cleanup (always)
+        if: always()
+        run: |
+          cat "$TUNNEL_DIR/tunnel.log" 2>/dev/null || cat ./tunnel.log || true
+          docker logs --tail 200 qemu || true
+          docker stop -t 120 qemu || true
+          kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          df -h || true
